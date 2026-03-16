@@ -152,6 +152,7 @@ ENV/
 env.bak/
 venv.bak/
 uv.lock
+.devcontainer/
 
 # Spyder project settings
 .spyderproject

@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from omegaconf import DictConfig, OmegaConf
+import wandb
 
 from eb_jepa.logging import get_logger
 
@@ -75,6 +76,9 @@ def setup_wandb(
             tags = list(tags) + [f"sweep_{sweep_id}"]
         else:
             tags = [f"sweep_{sweep_id}"]
+
+    if resume:
+      logger.info("Resumming training")
 
     # Check if we should resume an existing run
     if resume and run_id_file.exists():
@@ -188,13 +192,13 @@ def load_checkpoint(
     """Load a training checkpoint. Returns dict with epoch, step, and extra_state.
 
     The returned 'epoch' is the epoch to resume training from (0-indexed).
-    If no checkpoint exists, returns epoch=0 to start fresh.
     If a checkpoint exists with epoch=N, returns epoch=N+1 to resume from the next epoch.
+    Raises FileNotFoundError if the checkpoint does not exist.
     """
     path = Path(path)
     if not path.exists():
-        logger.warning(f"Checkpoint not found: {path}")
-        return {"epoch": 0, "step": 0, "resumed": False}
+        logger.error(f"Checkpoint not found: {path}")
+        raise FileNotFoundError(f"Checkpoint not found at path: {path}")
 
     map_location = device if device else "cpu"
     checkpoint = torch.load(path, map_location=map_location, weights_only=False)
@@ -417,3 +421,25 @@ def log_config(cfg: Union[Dict, DictConfig], title: str = "Run Configuration") -
         else:
             logger.info(f"  {section}={values}")
     logger.info("=" * 60)
+
+
+def log_checkpoint_to_wandb(checkpoint_path, epoch):
+    """
+    Uploads the local checkpoint file as an artifact to W&B.
+    """
+
+    # 1. Create the Artifact (type 'model')
+    artifact = wandb.Artifact(
+        name=f"run-{wandb.run.id}-models", 
+        type="model",
+        description=f"Model checkpoint for epoch {epoch}"
+    )
+    
+    # 2. Add the local file to the artifact
+    artifact.add_file(checkpoint_path)
+    
+    # 3. Log the artifact with its corresponding aliases
+    # This automatically updates the 'latest' tag to the most recently uploaded one
+    wandb.log_artifact(artifact, aliases=["latest", f"epoch_{epoch}"])
+    
+    print(f"✅ Checkpoint logged to W&B Artifacts (Epoch: {epoch})")

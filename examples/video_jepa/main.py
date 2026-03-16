@@ -11,7 +11,7 @@ import fire
 import torch.nn as nn
 from omegaconf import OmegaConf
 from torch.optim import Adam
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from eb_jepa.architectures import (
@@ -32,6 +32,7 @@ from eb_jepa.training_utils import (
     get_unified_experiment_dir,
     load_checkpoint,
     load_config,
+    log_checkpoint_to_wandb,
     log_config,
     log_data_info,
     log_epoch,
@@ -64,6 +65,9 @@ def run(
     # Load config
     if cfg is None:
         cfg = load_config(fname, overrides if overrides else None)
+    
+    if folder is None:
+        cfg.meta.load_model = False  # Don't load model if folder is auto-generated, even if the config says to load. This prevents accidental loading when running new experiments with default configs that have load_model=True.
 
     # Setup
     device = setup_device(cfg.meta.device)
@@ -100,11 +104,19 @@ def run(
         group=cfg.logging.get("wandb_group"),
         enabled=cfg.logging.log_wandb,
         sweep_id=cfg.logging.get("wandb_sweep_id"),
+        resume=True
     )
 
     # Load datasets
     train_set = MovingMNISTDet(split="train")
     val_set = MovingMNISTDet(split="val")
+
+    if cfg.training.get("train_on_subset"):
+        subset_size = cfg.training.train_on_subset
+        train_set = Subset(train_set, list(range(subset_size)))
+        val_set = Subset(val_set, list(range(subset_size)))
+        logger.info(f"Using only a subset of the training data: {subset_size} samples")
+
     train_loader = DataLoader(
         train_set,
         batch_size=cfg.data.batch_size,
@@ -167,6 +179,7 @@ def run(
     start_epoch = 0
     global_step = 0
     if cfg.meta.get("load_model"):
+        logger.info(f"Loading checkpoint from {cfg.meta.get('load_checkpoint', 'latest.pth.tar')}...")
         ckpt_path = exp_dir / cfg.meta.get("load_checkpoint", "latest.pth.tar")
         ckpt_info = load_checkpoint(ckpt_path, jepa, optimizer, device=device)
         start_epoch = ckpt_info.get("epoch", 0)
@@ -257,6 +270,9 @@ def run(
             epoch=epoch,
             step=global_step,
         )
+
+        log_checkpoint_to_wandb(exp_dir / "latest.pth.tar", epoch)
+        
         if epoch % cfg.logging.save_every == 0 and epoch > 0:
             save_checkpoint(
                 exp_dir / f"epoch_{epoch}.pth.tar",
