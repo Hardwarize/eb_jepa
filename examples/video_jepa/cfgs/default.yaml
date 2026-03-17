@@ -4,6 +4,9 @@
 meta:
   seed: 2025
   device: auto  # auto, cuda, or cpu
+  load_model: false
+  load_checkpoint:  # Path to checkpoint file (e.g., 'latest.pth.tar')
+  wandb_run_id: jc0ivv7m # Optional: W&B run ID to resume from (overrides load_checkpoint)
 
 data:
   dataset: moving_mnist
