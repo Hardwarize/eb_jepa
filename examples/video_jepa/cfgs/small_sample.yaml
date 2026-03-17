@@ -4,9 +4,7 @@
 meta:
   seed: 2025
   device: auto  # auto, cuda, or cpu
-  load_model: false
-  load_checkpoint:  # Path to checkpoint file (e.g., 'latest.pth.tar')
-  wandb_run_id: jc0ivv7m # Optional: W&B run ID to resume from (overrides load_checkpoint)
+  load_model: true
 
 data:
   dataset: moving_mnist
@@ -45,6 +43,7 @@ logging:
 training:
   use_amp: true       # Use automatic mixed precision
   dtype: float16      # float16 or bfloat16
+  train_on_subset: 20  # Use only a subset of the training data (e.g., 20 samples), to use if you just to want to check if the code runs without errors. Set to null or remove to train on the full dataset.
 
 # --- Parameters used when running with --full-sweep
 # By default, only the parameters specified above are used

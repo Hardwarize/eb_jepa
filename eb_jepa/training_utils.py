@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from omegaconf import DictConfig, OmegaConf
+import wandb
 
 from eb_jepa.logging import get_logger
 
@@ -75,6 +76,9 @@ def setup_wandb(
             tags = list(tags) + [f"sweep_{sweep_id}"]
         else:
             tags = [f"sweep_{sweep_id}"]
+
+    if resume:
+      logger.info("Resumming training")
 
     # Check if we should resume an existing run
     if resume and run_id_file.exists():
@@ -188,13 +192,13 @@ def load_checkpoint(
     """Load a training checkpoint. Returns dict with epoch, step, and extra_state.
 
     The returned 'epoch' is the epoch to resume training from (0-indexed).
-    If no checkpoint exists, returns epoch=0 to start fresh.
     If a checkpoint exists with epoch=N, returns epoch=N+1 to resume from the next epoch.
+    Raises FileNotFoundError if the checkpoint does not exist.
     """
     path = Path(path)
     if not path.exists():
-        logger.warning(f"Checkpoint not found: {path}")
-        return {"epoch": 0, "step": 0, "resumed": False}
+        logger.error(f"Checkpoint not found: {path}")
+        raise FileNotFoundError(f"Checkpoint not found at path: {path}")
 
     map_location = device if device else "cpu"
     checkpoint = torch.load(path, map_location=map_location, weights_only=False)
@@ -417,3 +421,183 @@ def log_config(cfg: Union[Dict, DictConfig], title: str = "Run Configuration") -
         else:
             logger.info(f"  {section}={values}")
     logger.info("=" * 60)
+
+
+def log_checkpoint_to_wandb(checkpoint_path, epoch):
+    """
+    Uploads the local checkpoint file as an artifact to W&B.
+    """
+
+    # 1. Create the Artifact (type 'model')
+    artifact = wandb.Artifact(
+        name=f"run-{wandb.run.id}-models", 
+        type="model",
+        description=f"Model checkpoint for epoch {epoch}"
+    )
+    
+    # 2. Add the local file to the artifact
+    artifact.add_file(checkpoint_path)
+    
+    # 3. Log the artifact with its corresponding aliases
+    # This automatically updates the 'latest' tag to the most recently uploaded one
+    wandb.log_artifact(artifact, aliases=["latest", f"epoch_{epoch}"])
+    
+    print(f"✅ Checkpoint logged to W&B Artifacts (Epoch: {epoch})")
+
+
+def download_checkpoint_from_wandb(
+    project: str,
+    run_id: str,
+    save_dir: Union[str, Path],
+    entity: Optional[str] = None,
+    artifact_alias: str = "latest",
+) -> Path:
+    """
+    Download the latest checkpoint from a W&B run's artifacts.
+    
+    Args:
+        project: W&B project name
+        run_id: W&B run ID to download from
+        save_dir: Local directory to save the downloaded checkpoint
+        entity: W&B entity/team name (optional, will try to infer from run)
+        artifact_alias: Artifact alias to download (default: "latest")
+    
+    Returns:
+        Path to the downloaded checkpoint file
+    """
+    import wandb
+    
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Initialize wandb API
+    api = wandb.Api(overrides={"disabled": True})
+    
+    try:
+        # Try to infer entity if not provided
+        if entity is None:
+            entity = os.getenv("WANDB_ENTITY", "")
+            if not entity:
+                # Try to get entity from the run path
+                # First attempt with just project/run_id
+                try:
+                    run = api.run(f"{project}/{run_id}")
+                    entity = run.entity
+                except:
+                    # Fallback: use default patterns
+                    entity = None
+        
+        # Construct the run path
+        if entity:
+            run_path = f"{entity}/{project}/{run_id}"
+        else:
+            run_path = f"{project}/{run_id}"
+        
+        logger.info(f"Fetching W&B run: {run_path}")
+        run = api.run(run_path)
+        logger.info(f"Found W&B run: {run.name} (created at {run.created_at})")
+        
+        # Collect model artifacts from this run and pick the latest version.
+        model_artifacts = []
+        if hasattr(run, "logged_artifacts"):
+            try:
+                artifacts = list(run.logged_artifacts())
+                logger.info(f"Found {len(artifacts)} artifacts in run")
+                model_artifacts = [a for a in artifacts if getattr(a, "type", "") == "model"]
+            except Exception as e:
+                logger.warning(f"Could not get artifacts from run object: {e}")
+
+        if not model_artifacts:
+            raise ValueError(
+                f"No model artifacts found for run {run_id}. "
+                f"Ensure checkpoints have been logged to W&B Artifacts. "
+                f"Available info: run_path={run_path}"
+            )
+
+        def _version_num(artifact_obj):
+            name = getattr(artifact_obj, "name", "")
+            if ":v" in name:
+                try:
+                    return int(name.rsplit(":v", 1)[1])
+                except ValueError:
+                    return -1
+            return -1
+
+        latest_by_alias = None
+        for artifact in model_artifacts:
+            aliases = set(getattr(artifact, "aliases", []) or [])
+            if artifact_alias in aliases:
+                if latest_by_alias is None or _version_num(artifact) > _version_num(latest_by_alias):
+                    latest_by_alias = artifact
+
+        if latest_by_alias is not None:
+            artifact_to_download = latest_by_alias
+            logger.info(
+                f"Selected model artifact by alias '{artifact_alias}': {artifact_to_download.name}"
+            )
+        else:
+            artifact_to_download = max(model_artifacts, key=_version_num)
+            logger.warning(
+                f"No artifact with alias '{artifact_alias}' found; selected highest version: {artifact_to_download.name}"
+            )
+        
+        logger.info(f"Downloading artifact: {artifact_to_download.name}...")
+        
+        # Download the artifact
+        artifact_dir = artifact_to_download.download(root=str(save_dir))
+        logger.info(f"Artifact downloaded to: {artifact_dir}")
+        
+        # Find the checkpoint file (usually .pth.tar)
+        checkpoint_files = list(Path(artifact_dir).glob("*.pth.tar"))
+        if not checkpoint_files:
+            checkpoint_files = list(Path(artifact_dir).glob("*.pt"))
+        if not checkpoint_files:
+            checkpoint_files = list(Path(artifact_dir).glob("**/*.pth.tar"))
+        if not checkpoint_files:
+            checkpoint_files = list(Path(artifact_dir).glob("**/*.pt"))
+        
+        if not checkpoint_files:
+            raise FileNotFoundError(
+                f"No checkpoint files (.pth.tar or .pt) found in artifact directory: {artifact_dir}\n"
+                f"Contents: {list(Path(artifact_dir).glob('*'))}"
+            )
+        
+        logger.info(f"Found {len(checkpoint_files)} checkpoint file(s): {[f.name for f in checkpoint_files]}")
+        
+        # If multiple checkpoints exist, select the one with highest epoch
+        if len(checkpoint_files) > 1:
+            best_checkpoint = None
+            best_epoch = -1
+            
+            for ckpt_file in checkpoint_files:
+                try:
+                    ckpt = torch.load(ckpt_file, map_location="cpu", weights_only=False)
+                    epoch_val = ckpt.get("epoch", -1)
+                    logger.info(f"  {ckpt_file.name}: epoch={epoch_val}")
+                    if epoch_val > best_epoch:
+                        best_epoch = epoch_val
+                        best_checkpoint = ckpt_file
+                except Exception as e:
+                    logger.warning(f"Could not inspect {ckpt_file.name}: {e}")
+            
+            if best_checkpoint:
+                checkpoint_path = best_checkpoint
+                logger.info(f"✅ Selected checkpoint with highest epoch: {checkpoint_path.name} (epoch={best_epoch})")
+            else:
+                checkpoint_path = checkpoint_files[0]
+                logger.warning(f"Could not inspect checkpoints, using first one: {checkpoint_path.name}")
+        else:
+            checkpoint_path = checkpoint_files[0]
+            try:
+                ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+                epoch_val = ckpt.get("epoch", -1)
+                
+                logger.info(f"✅ Downloaded checkpoint: {checkpoint_path.name} (epoch={epoch_val})")
+            except Exception as e:
+                logger.info(f"✅ Downloaded checkpoint: {checkpoint_path.name}")
+        
+        return checkpoint_path
+        
+    except Exception as e:
+        logger.error(f"Failed to download checkpoint from W&B run {run_id}: {str(e)}")
+        raise

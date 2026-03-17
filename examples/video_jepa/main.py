@@ -11,7 +11,7 @@ import fire
 import torch.nn as nn
 from omegaconf import OmegaConf
 from torch.optim import Adam
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from eb_jepa.architectures import (
@@ -32,6 +32,7 @@ from eb_jepa.training_utils import (
     get_unified_experiment_dir,
     load_checkpoint,
     load_config,
+    log_checkpoint_to_wandb,
     log_config,
     log_data_info,
     log_epoch,
@@ -40,6 +41,7 @@ from eb_jepa.training_utils import (
     setup_device,
     setup_seed,
     setup_wandb,
+    download_checkpoint_from_wandb,
 )
 from examples.video_jepa.eval import validation_loop
 
@@ -64,6 +66,14 @@ def run(
     # Load config
     if cfg is None:
         cfg = load_config(fname, overrides if overrides else None)
+    
+    # Handle W&B run ID (if provided, always load the model)
+    wandb_run_id = cfg.meta.get("wandb_run_id")
+    if wandb_run_id:
+        logger.info(f"Resuming from W&B run: {wandb_run_id}")
+        cfg.meta.load_model = True
+    elif folder is None:
+        cfg.meta.load_model = False  # Don't load model if folder is auto-generated, even if the config says to load. This prevents accidental loading when running new experiments with default configs that have load_model=True.
 
     # Setup
     device = setup_device(cfg.meta.device)
@@ -91,6 +101,26 @@ def run(
         folder_name = exp_dir.name  # e.g., "resnet_std10.0_cov100.0_seed1"
         exp_name = folder_name.rsplit("_seed", 1)[0]  # e.g., "resnet_std10.0_cov100.0"
 
+    # Handle W&B run resumption: download checkpoint if run_id is provided
+    if wandb_run_id:
+        logger.info(f"Downloading checkpoint from W&B run: {wandb_run_id}")
+        try:
+            checkpoint_path = download_checkpoint_from_wandb(
+                project="eb_jepa",
+                run_id=wandb_run_id,
+                save_dir=exp_dir / "wandb_checkpoints"
+            )
+            cfg.meta.load_checkpoint = str(checkpoint_path)
+            logger.info(f"Checkpoint downloaded to: {checkpoint_path}")
+            
+            # Save the W&B run ID so it can be resumed
+            run_id_file = exp_dir / "wandb_run_id.txt"
+            with open(run_id_file, "w") as f:
+                f.write(wandb_run_id)
+        except Exception as e:
+            logger.error(f"Failed to download checkpoint from W&B: {e}")
+            raise
+
     wandb_run = setup_wandb(
         project="eb_jepa",
         config={"example": "video_jepa", **OmegaConf.to_container(cfg, resolve=True)},
@@ -100,11 +130,19 @@ def run(
         group=cfg.logging.get("wandb_group"),
         enabled=cfg.logging.log_wandb,
         sweep_id=cfg.logging.get("wandb_sweep_id"),
+        resume=True
     )
 
     # Load datasets
     train_set = MovingMNISTDet(split="train")
     val_set = MovingMNISTDet(split="val")
+
+    if cfg.training.get("train_on_subset"):
+        subset_size = cfg.training.train_on_subset
+        train_set = Subset(train_set, list(range(subset_size)))
+        val_set = Subset(val_set, list(range(subset_size)))
+        logger.info(f"Using only a subset of the training data: {subset_size} samples")
+
     train_loader = DataLoader(
         train_set,
         batch_size=cfg.data.batch_size,
@@ -167,10 +205,20 @@ def run(
     start_epoch = 0
     global_step = 0
     if cfg.meta.get("load_model"):
-        ckpt_path = exp_dir / cfg.meta.get("load_checkpoint", "latest.pth.tar")
+        checkpoint_str = cfg.meta.get("load_checkpoint", "latest.pth.tar")
+        # Handle both absolute paths (from W&B download) and relative paths
+        if Path(checkpoint_str).is_absolute():
+            ckpt_path = Path(checkpoint_str)
+        else:
+            ckpt_path = exp_dir / checkpoint_str
+        
+        logger.info(f"Loading checkpoint from {ckpt_path}...")
         ckpt_info = load_checkpoint(ckpt_path, jepa, optimizer, device=device)
         start_epoch = ckpt_info.get("epoch", 0)
         global_step = ckpt_info.get("step", 0)
+        logger.info(
+            f"Resumed checkpoint state: last_epoch={start_epoch - 1}, next_epoch={start_epoch}, global_step={global_step}"
+        )
 
     # Training loop
     logger.info(f"Starting training for {cfg.optim.epochs} epochs...")
@@ -257,6 +305,9 @@ def run(
             epoch=epoch,
             step=global_step,
         )
+
+        log_checkpoint_to_wandb(exp_dir / "latest.pth.tar", epoch)
+        
         if epoch % cfg.logging.save_every == 0 and epoch > 0:
             save_checkpoint(
                 exp_dir / f"epoch_{epoch}.pth.tar",
