@@ -439,7 +439,7 @@ def run(
         features_dim = 384
         model_kwargs = dict(
             image_size=32,
-            patch_size=8,
+            patch_size=cfg.model.get("patch_size", 8),
             hidden_dim=features_dim,
             num_layers=12,
             num_heads=6,
@@ -451,7 +451,7 @@ def run(
         features_dim = 768
         model_kwargs = dict(
             image_size=32,
-            patch_size=8,
+            patch_size=cfg.model.get("patch_size", 8),
             hidden_dim=features_dim,
             num_layers=12,
             num_heads=12,
