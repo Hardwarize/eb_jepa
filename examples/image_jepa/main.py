@@ -218,6 +218,7 @@ class WarmupCosineScheduler:
         base_lr,
         min_lr=0.0,
         warmup_start_lr=3e-5,
+        group_indices=None,
     ):
         self.optimizer = optimizer
         self.warmup_epochs = warmup_epochs
@@ -225,6 +226,7 @@ class WarmupCosineScheduler:
         self.base_lr = base_lr
         self.min_lr = min_lr
         self.warmup_start_lr = warmup_start_lr
+        self.group_indices = group_indices
 
     def step(self, epoch):
         if epoch < self.warmup_epochs:
@@ -243,7 +245,12 @@ class WarmupCosineScheduler:
                 )
             )
 
-        for param_group in self.optimizer.param_groups:
+        if self.group_indices is None:
+            param_groups = self.optimizer.param_groups
+        else:
+            param_groups = [self.optimizer.param_groups[idx] for idx in self.group_indices]
+
+        for param_group in param_groups:
             param_group["lr"] = lr
 
 
@@ -251,7 +258,6 @@ def train_epoch(
     model,
     train_loader,
     optimizer,
-    scheduler,
     linear_probe,
     scaler,
     device,
@@ -513,6 +519,7 @@ def run(
         base_lr=cfg.optim.lr,
         min_lr=cfg.optim.min_lr,
         warmup_start_lr=cfg.optim.warmup_start_lr,
+        group_indices=[0],
     )
 
     # Initialize loss function
@@ -537,12 +544,13 @@ def run(
     tqdm_silent = cfg.logging.get("tqdm_silent", False)
 
     for epoch in range(start_epoch, cfg.optim.epochs):
+        scheduler.step(epoch)
+
         # Train
         train_metrics = train_epoch(
             model,
             train_loader,
             optimizer,
-            scheduler,
             linear_probe,
             scaler,
             device,
