@@ -134,6 +134,16 @@ You can override any config parameter using dot notation:
 python -m examples.image_jepa.main --fname examples/image_jepa/cfgs/default.yaml optim.epochs=50 data.batch_size=128
 ```
 
+### Resume Training from W&B
+
+If training is interrupted, you can resume an Image JEPA run from the latest checkpoint artifact stored in Weights & Biases:
+
+```bash
+python -m examples.image_jepa.main --fname examples/image_jepa/cfgs/default.yaml meta.wandb_run_id=<YOUR_WANDB_RUN_ID>
+```
+
+This downloads the latest checkpoint artifact for the run, restores the model and optimizer state, and continues logging to the same W&B run.
+
 ## Results
 
 ### Comparison: SIGReg and VICReg

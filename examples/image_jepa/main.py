@@ -34,11 +34,13 @@ from tqdm import tqdm
 from eb_jepa.logging import get_logger
 from eb_jepa.losses import BCS, VICRegLoss
 from eb_jepa.training_utils import (
+    download_checkpoint_from_wandb,
     get_default_dev_name,
     get_exp_name,
     get_unified_experiment_dir,
     load_checkpoint,
     load_config,
+    log_checkpoint_to_wandb,
     log_config,
     log_data_info,
     log_epoch,
@@ -351,6 +353,12 @@ def run(
     if cfg is None:
         cfg = load_config(fname, overrides if overrides else None)
 
+    # Support both config-based and direct CLI W&B run ID overrides.
+    wandb_run_id = cfg.meta.get("wandb_run_id") or cfg.get("wandb_run_id")
+    if wandb_run_id:
+        logger.info(f"Resuming from W&B run: {wandb_run_id}")
+        cfg.meta.load_model = True
+
     # Setup using shared utilities
     device = setup_device(cfg.meta.device)
     setup_seed(cfg.meta.seed)
@@ -377,6 +385,24 @@ def run(
         folder_name = exp_dir.name  # e.g., "resnet_vicreg_seed1"
         exp_name = folder_name.rsplit("_seed", 1)[0]  # e.g., "resnet_vicreg"
 
+    if wandb_run_id:
+        logger.info(f"Downloading checkpoint from W&B run: {wandb_run_id}")
+        try:
+            checkpoint_path = download_checkpoint_from_wandb(
+                project="eb_jepa",
+                run_id=wandb_run_id,
+                save_dir=exp_dir / "wandb_checkpoints",
+            )
+            cfg.meta.load_checkpoint = str(checkpoint_path)
+            logger.info(f"Checkpoint downloaded to: {checkpoint_path}")
+
+            run_id_file = exp_dir / "wandb_run_id.txt"
+            with open(run_id_file, "w") as f:
+                f.write(wandb_run_id)
+        except Exception as e:
+            logger.error(f"Failed to download checkpoint from W&B: {e}")
+            raise
+
     wandb_run = setup_wandb(
         project="eb_jepa",
         config={"example": "image_jepa", **OmegaConf.to_container(cfg, resolve=True)},
@@ -386,6 +412,7 @@ def run(
         group=cfg.logging.get("wandb_group"),
         enabled=cfg.logging.log_wandb,
         sweep_id=cfg.logging.get("wandb_sweep_id"),
+        resume=True,
     )
 
     logger.info("Loading CIFAR-10 dataset...")
@@ -524,8 +551,20 @@ def run(
     # Load checkpoint if requested
     start_epoch = 0
     if cfg.meta.get("load_model"):
-        ckpt_path = exp_dir / cfg.meta.get("load_checkpoint", "latest.pth.tar")
-        ckpt_info = load_checkpoint(ckpt_path, model, optimizer, device=device)
+        checkpoint_str = cfg.meta.get("load_checkpoint", "latest.pth.tar")
+        if Path(checkpoint_str).is_absolute():
+            ckpt_path = Path(checkpoint_str)
+        else:
+            ckpt_path = exp_dir / checkpoint_str
+
+        logger.info(f"Loading checkpoint from {ckpt_path}...")
+        ckpt_info = load_checkpoint(
+            ckpt_path,
+            model,
+            optimizer,
+            scaler=scaler,
+            device=device,
+        )
         start_epoch = ckpt_info.get("epoch", 0)
         if "linear_probe_state_dict" in ckpt_info:
             linear_probe.load_state_dict(ckpt_info["linear_probe_state_dict"])
@@ -593,6 +632,9 @@ def run(
             linear_probe_state_dict=linear_probe.state_dict(),
             linear_val_acc=val_acc,
         )
+        if wandb_run:
+            log_checkpoint_to_wandb(exp_dir / "latest.pth.tar", epoch)
+
         if epoch % cfg.logging.save_every == 0 and epoch > 0:
             save_checkpoint(
                 exp_dir / f"epoch_{epoch}.pth.tar",

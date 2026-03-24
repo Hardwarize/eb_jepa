@@ -1,6 +1,9 @@
 meta:
   seed: 42
   device: auto
+  load_model: false
+  load_checkpoint:
+  wandb_run_id:
 
 data:
   dataset: cifar10
